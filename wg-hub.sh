@@ -181,7 +181,7 @@ input() {
 }
 
 menu_main() {
-  whiptail --title "WG HUB" --menu "Выберите действие" 26 100 16 \
+  whiptail --title "WG HUB" --menu "Корень: хаб, ноды, клиенты (п.4), bootstrap, диагностика. Нужен root, Debian 13." 27 100 16 \
     "1" "Инициализация хаба (обязательно сначала)" \
     "2" "Добавить entry-exit (только домен VPS)" \
     "3" "Добавить exit-only (только домен VPS)" \
@@ -199,16 +199,22 @@ menu_main() {
 menu_clients() {
   while true; do
     local mc
-    mc="$(whiptail --title "Пользователи" --menu "Клиенты WireGuard" 20 78 10 \
+    mc="$(whiptail --title "Пользователи WireGuard" --menu "Клиенты: создать, смотреть конфиг/QR, список, удалить, синхронизировать пиры с базой, экспорт. На другой entry-VPS после изменений скопируйте state/ или повторите синхронизацию там." 28 92 16 \
       "1" "Создать клиента (1–2 устройства)" \
-      "2" "Показать конфиг (текст) + QR в PNG" \
-      "3" "Список клиентов" \
+      "2" "Просмотр конфига (текст) + QR PNG" \
+      "3" "Список клиентов и устройств" \
+      "4" "Удалить клиента" \
+      "5" "Пересобрать пиры из базы + wg-users" \
+      "6" "Экспорт клиента в .tar.gz" \
       "0" "Назад" \
       3>&1 1>&2 2>&3)" || break
     case "$mc" in
       1) create_client ;;
       2) browse_client_config_ui ;;
       3) list_clients_menu ;;
+      4) delete_client_ui ;;
+      5) menu_clients_repair_from_db ;;
+      6) export_client_archive_ui ;;
       0|"") break ;;
     esac
   done
@@ -379,14 +385,55 @@ EOF
   fi
 }
 
-resync_wg_users_local() {
-  sanitize_nodes_db
+apply_wg_users_all_entry_nodes() {
   local id
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     apply_wg_users_live_for_node "$id"
   done < <(awk -F'|' 'NR>1 && $2=="entry-exit" {print $1}' "$NODES_DB")
+}
+
+resync_wg_users_local() {
+  sanitize_nodes_db
+  apply_wg_users_all_entry_nodes
   msg "Для каждой entry-ноды проверено: если это текущий сервер (ключ wg-users), /etc/wireguard/wg-users.conf перезаписан из $SERVER_PEERS_DIR и wg-quick перезапущен."
+}
+
+rebuild_all_server_peers_from_clients_db() {
+  local id role usub vlan c1 di c3 dev_name priv pub octet cr
+  mkdir -p "$SERVER_PEERS_DIR"
+  while IFS='|' read -r id role _; do
+    [[ "$role" == "entry-exit" ]] || continue
+    : >"$SERVER_PEERS_DIR/$id.peers.conf"
+  done < <(awk -F'|' 'NR>1 {print $1"|"$2}' "$NODES_DB")
+
+  [[ -f "$CLIENTS_DB" ]] || return 0
+  [[ "$(wc -l <"$CLIENTS_DB")" -ge 2 ]] || return 0
+
+  while IFS='|' read -r c1 di c3 dev_name priv pub octet cr; do
+    [[ -n "$pub" ]] || continue
+    [[ "$octet" =~ ^[0-9]+$ ]] || continue
+    while IFS='|' read -r id role; do
+      [[ "$role" == "entry-exit" ]] || continue
+      usub="$(get_node_field "$id" 12)"
+      if [[ "$usub" =~ ^10\.88\.([0-9]+)\.0/24$ ]]; then
+        vlan="${BASH_REMATCH[1]}"
+        cat >>"$SERVER_PEERS_DIR/$id.peers.conf" <<EOF
+[Peer]
+# ${dev_name}
+PublicKey = ${pub}
+AllowedIPs = 10.88.${vlan}.${octet}/32
+
+EOF
+      fi
+    done < <(awk -F'|' 'NR>1 {print $1"|"$2}' "$NODES_DB")
+  done < <(tail -n +2 "$CLIENTS_DB")
+}
+
+repair_peers_and_wg_users_from_db() {
+  sanitize_nodes_db
+  rebuild_all_server_peers_from_clients_db
+  apply_wg_users_all_entry_nodes
 }
 
 ensure_nft_include_line() {
@@ -712,14 +759,6 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-    cat >>"$SERVER_PEERS_DIR/$msk1_id.peers.conf" <<EOF
-[Peer]
-# ${dev_name}
-PublicKey = ${dev_pub}
-AllowedIPs = 10.88.1.${octet}/32
-
-EOF
-
     if [[ "$dual_entry" -eq 1 ]]; then
       ip2="10.88.${vlan2}.${octet}/32"
       cat >"$dir/${dev_name}-MSKGAMING.conf" <<EOF
@@ -734,14 +773,6 @@ Endpoint = ${msk2_ep}:${msk2_port}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
-
-      cat >>"$SERVER_PEERS_DIR/$msk2_id.peers.conf" <<EOF
-[Peer]
-# ${dev_name}
-PublicKey = ${dev_pub}
-AllowedIPs = 10.88.${vlan2}.${octet}/32
-
-EOF
     fi
 
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$client_name" "$i" "$client_name" "$dev_name" "$dev_priv" "$dev_pub" "$octet" "$now" >>"$CLIENTS_DB"
@@ -749,10 +780,7 @@ EOF
     octet=$((octet + 1))
   done
   save_meta_octet "$octet"
-  apply_wg_users_live_for_node "$msk1_id"
-  if [[ "$dual_entry" -eq 1 ]]; then
-    apply_wg_users_live_for_node "$msk2_id"
-  fi
+  repair_peers_and_wg_users_from_db
   present_client_artifacts "$client_name"
   if [[ "$dual_entry" -eq 1 ]]; then
     msg "MSK-1 + резерв MSK-GAMING. wg-users обновлён на подходящих нодах.\nUDP wg-users откройте в фаерволе облака."
@@ -788,7 +816,7 @@ present_client_artifacts() {
 
 browse_client_config_ui() {
   local name args i sel f tmp
-  name="$(input "Клиент" "Имя клиента (каталог в output/clients)" "")"
+  name="$(pick_client_name_interactive "Просмотр конфига" "Выберите клиента")" || return
   [[ -n "$name" ]] || return
   if [[ ! -d "$CLIENTS_DIR/$name" ]]; then
     msg "Нет каталога: $CLIENTS_DIR/$name"
@@ -823,18 +851,79 @@ browse_client_config_ui() {
 }
 
 list_clients_menu() {
-  local tmp
-  tmp="$(mktemp)"
+  local tmp nlines  tmp="$(mktemp)"
+  nlines="$(awk -F'|' 'NR>1' "$CLIENTS_DB" 2>/dev/null | wc -l)"
+  nlines="${nlines//[[:space:]]/}"
   {
-    echo "База $CLIENTS_DB (имя | устройство | октет | время):"
+    echo "Всего записей устройств в базе: ${nlines:-0}"
+    echo "Файл: $CLIENTS_DB"
+    echo "Каталог конфигов: $CLIENTS_DIR"
+    echo
+    echo "имя_клиента | устройство | октет | создано"
     echo "----------------------------------------------------------------"
     awk -F'|' 'NR>1 { printf "%-18s %-22s %-6s %s\n", $1, $4, $7, $8 }' "$CLIENTS_DB" 2>/dev/null || true
     echo
-    echo "Каталоги в $CLIENTS_DIR:"
+    echo "Каталоги (по одному на клиента):"
     ls -1 "$CLIENTS_DIR" 2>/dev/null || echo "(пусто)"
   } >"$tmp"
-  whiptail --title "Список клиентов" --scrolltext --textbox "$tmp" 28 100
+  whiptail --title "Список клиентов" --scrolltext --textbox "$tmp" 30 100
   rm -f "$tmp"
+}
+
+pick_client_name_interactive() {
+  local title="$1" subtitle="$2" dirs args d nconf sel manual
+  manual="__manual_name__"
+  mapfile -t dirs < <(ls -1 "$CLIENTS_DIR" 2>/dev/null | sort)
+  if [[ "${#dirs[@]}" -eq 0 ]]; then
+    whiptail --title "$title" --msgbox "Пока нет клиентов.\n$CLIENTS_DIR пуст.\n\nСоздайте клиента: п.1 в этом меню." 12 62
+    return 1
+  fi
+  args=()
+  for d in "${dirs[@]}"; do
+    nconf="$(find "$CLIENTS_DIR/$d" -name '*.conf' -type f 2>/dev/null | wc -l)"
+    nconf="${nconf//[[:space:]]/}"
+    args+=("$d" "$d  (${nconf} .conf)")
+  done
+  args+=("$manual" "Ввести имя каталога вручную…")
+  sel="$(whiptail --title "$title" --menu "$subtitle" 26 80 14 "${args[@]}" 3>&1 1>&2 2>&3)" || return 1
+  if [[ "$sel" == "$manual" ]]; then
+    input "Клиент" "Имя каталога (латиницей)" ""
+    return
+  fi
+  printf '%s' "$sel"
+}
+
+delete_client_ui() {
+  sanitize_nodes_db
+  local name tmp
+  name="$(pick_client_name_interactive "Удалить клиента" "Все устройства этого клиента исчезнут из базы и с диска.")" || return
+  [[ -n "$name" ]] || return
+  if ! whiptail --title "Удаление" --yesno "Удалить клиента «$name»?\n\nИз clients.db, каталога и пиров (пересборка из оставшихся записей).\nНа другой entry-VPS: скопируйте state/ или повторите удаление/синхронизацию там." 16 72; then
+    return
+  fi
+  tmp="$(mktemp)"
+  awk -F'|' -v n="$name" 'NR==1 || $1!=n' "$CLIENTS_DB" >"$tmp"
+  mv "$tmp" "$CLIENTS_DB"
+  rm -rf "${CLIENTS_DIR:?}/$name"
+  repair_peers_and_wg_users_from_db
+  msg "Клиент «$name» удалён.\nПиры пересобраны из clients.db; wg-users на этой машине обновлён (если ключ совпадает с entry-нодой)."
+}
+
+export_client_archive_ui() {
+  local name out
+  name="$(pick_client_name_interactive "Экспорт" "Будет создан архив в output/")" || return
+  [[ -n "$name" ]] || return
+  out="$OUTPUT_DIR/client-${name}-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "$out" -C "$CLIENTS_DIR" "$name"
+  msg "Готово:\n$out\n\nСкопировать: scp root@VPS:$out ."
+}
+
+menu_clients_repair_from_db() {
+  if ! whiptail --title "Синхронизация пиров" --yesno "Пересобрать $SERVER_PEERS_DIR/*.conf из clients.db и перезаписать wg-users на этом сервере (для entry-нод с совпадающим ключом)?" 12 74; then
+    return
+  fi
+  repair_peers_and_wg_users_from_db
+  msg "Пиры заново собраны из clients.db, wg-users перезапущен где применимо."
 }
 
 open_lists_hint() {
