@@ -589,6 +589,7 @@ create_or_update_node() {
 
 create_client() {
   local client_name count i octet now dev_name keys dev_priv dev_pub msk1_id msk2_id msk1_ep msk2_ep msk1_port msk2_port
+  local dir ip1 ip2 msk1_pub msk2_pub msk2_net vlan2 dual_entry
   client_name="$(input "Клиент" "Имя клиента (латиницей)" "")"
   count="$(whiptail --title "Клиент" --menu "Сколько устройств?" 12 60 2 "1" "Одно устройство" "2" "Два устройства" 3>&1 1>&2 2>&3)"
   msk1_id="msk-1"
@@ -597,15 +598,25 @@ create_client() {
     msg "Не найдена entry-нодa msk-1"
     return
   fi
-  if [[ -z "$msk2_id" ]] || ! node_exists "$msk2_id"; then
-    msg "Не найдена вторая entry-нодa (например msk-gaming)"
-    return
+  dual_entry=0
+  if [[ -n "$msk2_id" ]] && node_exists "$msk2_id"; then
+    dual_entry=1
   fi
 
   msk1_ep="$(get_node_field "$msk1_id" 4)"
-  msk2_ep="$(get_node_field "$msk2_id" 4)"
   msk1_port="$(get_node_field "$msk1_id" 13)"
-  msk2_port="$(get_node_field "$msk2_id" 13)"
+  msk1_pub="$(<"$STATE_DIR/$msk1_id.users.pub")"
+  if [[ "$dual_entry" -eq 1 ]]; then
+    msk2_ep="$(get_node_field "$msk2_id" 4)"
+    msk2_port="$(get_node_field "$msk2_id" 13)"
+    msk2_pub="$(<"$STATE_DIR/$msk2_id.users.pub")"
+    msk2_net="$(get_node_field "$msk2_id" 12)"
+    if [[ "$msk2_net" =~ ^10\.88\.([0-9]+)\.0/24$ ]]; then
+      vlan2="${BASH_REMATCH[1]}"
+    else
+      vlan2="2"
+    fi
+  fi
 
   octet="$(next_client_octet)"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -620,19 +631,9 @@ create_client() {
     dev_priv="${keys%%|*}"
     dev_pub="${keys##*|}"
 
-       local dir ip1 ip2 msk1_pub msk2_pub msk2_net vlan2
     dir="$CLIENTS_DIR/$client_name/$dev_name"
     mkdir -p "$dir"
     ip1="10.88.1.${octet}/32"
-    msk2_net="$(get_node_field "$msk2_id" 12)"
-    if [[ "$msk2_net" =~ ^10\.88\.([0-9]+)\.0/24$ ]]; then
-      vlan2="${BASH_REMATCH[1]}"
-    else
-      vlan2="2"
-    fi
-    ip2="10.88.${vlan2}.${octet}/32"
-    msk1_pub="$(<"$STATE_DIR/$msk1_id.users.pub")"
-    msk2_pub="$(<"$STATE_DIR/$msk2_id.users.pub")"
 
     cat >"$dir/${dev_name}-MSK1.conf" <<EOF
 [Interface]
@@ -647,7 +648,17 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-    cat >"$dir/${dev_name}-MSKGAMING.conf" <<EOF
+    cat >>"$SERVER_PEERS_DIR/$msk1_id.peers.conf" <<EOF
+[Peer]
+# ${dev_name}
+PublicKey = ${dev_pub}
+AllowedIPs = 10.88.1.${octet}/32
+
+EOF
+
+    if [[ "$dual_entry" -eq 1 ]]; then
+      ip2="10.88.${vlan2}.${octet}/32"
+      cat >"$dir/${dev_name}-MSKGAMING.conf" <<EOF
 [Interface]
 PrivateKey = ${dev_priv}
 Address = ${ip2}
@@ -660,30 +671,27 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-    cat >>"$SERVER_PEERS_DIR/$msk1_id.peers.conf" <<EOF
-[Peer]
-# ${dev_name}
-PublicKey = ${dev_pub}
-AllowedIPs = 10.88.1.${octet}/32
-
-EOF
-
-    cat >>"$SERVER_PEERS_DIR/$msk2_id.peers.conf" <<EOF
+      cat >>"$SERVER_PEERS_DIR/$msk2_id.peers.conf" <<EOF
 [Peer]
 # ${dev_name}
 PublicKey = ${dev_pub}
 AllowedIPs = 10.88.${vlan2}.${octet}/32
 
 EOF
+      qrencode -t ANSIUTF8 <"$dir/${dev_name}-MSKGAMING.conf" || true
+    fi
 
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$client_name" "$i" "$client_name" "$dev_name" "$dev_priv" "$dev_pub" "$octet" "$now" >>"$CLIENTS_DB"
 
     qrencode -t ANSIUTF8 <"$dir/${dev_name}-MSK1.conf" || true
-    qrencode -t ANSIUTF8 <"$dir/${dev_name}-MSKGAMING.conf" || true
     octet=$((octet + 1))
   done
   save_meta_octet "$octet"
-  msg "Клиент создан. Файлы: $CLIENTS_DIR/$client_name"
+  if [[ "$dual_entry" -eq 1 ]]; then
+    msg "Клиент создан (MSK-1 + резерв MSK-GAMING). Файлы: $CLIENTS_DIR/$client_name"
+  else
+    msg "Клиент создан только для MSK-1. Второй конфиг появится после добавления второй entry-ноды (п.2) и п.7.\nФайлы: $CLIENTS_DIR/$client_name"
+  fi
 }
 
 show_client_qr() {
