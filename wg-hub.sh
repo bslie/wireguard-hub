@@ -706,17 +706,41 @@ regenerate_bootstrap() {
   msg "Bootstrap-скрипты пересозданы: $BOOTSTRAP_DIR"
 }
 
+wg_iface_list() {
+  wg show interfaces 2>/dev/null | tr -s '[:space:]' '\n' | awk 'NF'
+}
+
+pick_wg_iface_for_status() {
+  local iface local_pub
+  if wg show wg-backbone dump &>/dev/null; then
+    printf '%s' "wg-backbone"
+    return 0
+  fi
+  while read -r iface; do
+    [[ -n "$iface" ]] || continue
+    wg show "$iface" dump &>/dev/null || continue
+    local_pub="$(wg show "$iface" dump 2>/dev/null | awk -F'\t' 'NR == 1 && NF == 4 { print $2; exit }')"
+    [[ -n "$local_pub" ]] || continue
+    if awk -F'|' -v p="$local_pub" 'NR > 1 && $10 == p { found = 1; exit } END { exit !found }' "$NODES_DB"; then
+      printf '%s' "$iface"
+      return 0
+    fi
+  done < <(wg_iface_list)
+  return 1
+}
+
 show_nodes_status() {
   sanitize_nodes_db
-  local rep hs now local_pub wg_ok
+  local rep hs now local_pub wg_ok wg_iface
   rep="$(mktemp)"
   hs="$(mktemp)"
   now="$(date +%s)"
   wg_ok=0
-  if wg show wg-backbone dump &>/dev/null; then
+  wg_iface=""
+  if wg_iface="$(pick_wg_iface_for_status)"; then
     wg_ok=1
-    wg show wg-backbone dump 2>/dev/null | awk -F'\t' 'NF == 8 { print $1 "\t" ($5 + 0) }' >"$hs"
-    local_pub="$(wg show wg-backbone dump 2>/dev/null | awk -F'\t' 'NR == 1 && NF == 4 { print $2; exit }')"
+    wg show "$wg_iface" dump 2>/dev/null | awk -F'\t' 'NF == 8 { print $1 "\t" ($5 + 0) }' >"$hs"
+    local_pub="$(wg show "$wg_iface" dump 2>/dev/null | awk -F'\t' 'NR == 1 && NF == 4 { print $2; exit }')"
   else
     : >"$hs"
     local_pub=""
@@ -724,8 +748,12 @@ show_nodes_status() {
 
   {
     printf 'Сводка по нодам из %s\n' "$NODES_DB"
-    printf 'Эта машина: wg-backbone %s. Онлайн по туннелю: рукопожатие не старше 3 мин.\n' \
-      "$([[ "$wg_ok" -eq 1 ]] && echo "есть" || echo "не поднят (только ping)")"
+    if [[ "$wg_ok" -eq 1 ]]; then
+      printf 'WireGuard: интерфейс «%s». Онлайн по туннелю: рукопожатие не старше 3 мин.\n' "$wg_iface"
+    else
+      printf 'WireGuard: интерфейс backbone не найден (нет wg-backbone и нет iface с ключом из nodes.db).\n'
+      printf 'Запустите bootstrap на этой машине или поднимите wg-quick@wg-backbone — иначе виден только ping.\n'
+    fi
     printf 'Ping: один ICMP; если ICMP запрещён — «офлайн» не значит, что WG мёртв.\n\n'
 
     printf '%-14s %-10s %-22s %-10s %s\n' "ID" "Роль" "Туннель (backbone)" "Ping" "Проверка (IP/домен)"
@@ -741,7 +769,7 @@ show_nodes_status() {
       if [[ "$wg_ok" -eq 1 && -n "$local_pub" && "$pub" == "$local_pub" ]]; then
         tun="локально"
       elif [[ "$wg_ok" -ne 1 ]]; then
-        tun="— (нет wg)"
+        tun="—"
       else
         lhs="$(awk -F'\t' -v p="$pub" '$1 == p { print $2; exit }' "$hs")"
         if [[ -z "$lhs" ]]; then
@@ -807,12 +835,23 @@ init_hub() {
   install_dependencies
   init_layout
   sanitize_nodes_db
+  local had_msk1=0 bs="$BOOTSTRAP_DIR/bootstrap-msk-1.sh"
+  node_exists "msk-1" && had_msk1=1
   ensure_hub_seed_node
   if ! node_exists "msk-1"; then
     return
   fi
-  render_bootstrap_entry_exit "msk-1" "$BOOTSTRAP_DIR/bootstrap-msk-1.sh"
-  msg "Хаб инициализирован. База: $WG_HUB_HOME"
+  render_bootstrap_entry_exit "msk-1" "$bs"
+  chmod +x "$bs" 2>/dev/null || true
+  if [[ "$had_msk1" -eq 0 ]]; then
+    if ! bash "$bs"; then
+      msg "База: $WG_HUB_HOME\nНе удалось поднять exit (WireGuard + NAT) автоматически. Запустите:\n  bash $bs"
+      return
+    fi
+    msg "Хаб инициализирован и сразу работает как exit: NAT для клиентов wg-users, форвардинг.\nБаза: $WG_HUB_HOME"
+  else
+    msg "msk-1 уже в базе — обновлён $bs\nЧтобы применить заново: bash $bs\nБаза: $WG_HUB_HOME"
+  fi
 }
 
 main() {
