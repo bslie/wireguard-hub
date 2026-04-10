@@ -355,7 +355,13 @@ apt-get install -y wireguard-tools nftables iproute2
 install -d -m 700 /etc/wireguard
 install -d -m 755 /etc/nftables.d
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
-grep -q '^net.ipv4.ip_forward=1$' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+if [[ -f /etc/sysctl.conf ]]; then
+  grep -q '^net.ipv4.ip_forward=1$' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+else
+  install -d -m 755 /etc/sysctl.d
+  printf '%s\n' 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wg-hub-ipforward.conf
+  chmod 644 /etc/sysctl.d/99-wg-hub-ipforward.conf
+fi
 EOF
 }
 
@@ -458,14 +464,18 @@ if [[ -f /opt/wg-hub/state/lists/ams_runtime.txt ]]; then
   done </opt/wg-hub/state/lists/ams_runtime.txt
 fi
 EOF
-    cat <<EOF
-${policy_routes}
-grep -q '/etc/nftables.d/\*\.nft' /etc/nftables.conf || echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
+    cat <<'EOF'
+grep -q '/etc/nftables.d/\*\.nft' /etc/nftables.conf 2>/dev/null || echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
 systemctl enable nftables wg-quick@wg-backbone wg-quick@wg-users
 systemctl restart nftables
 systemctl restart wg-quick@wg-backbone
 systemctl restart wg-quick@wg-users
-wg show
+EOF
+    cat <<EOF
+${policy_routes}
+EOF
+    cat <<EOF
+wg show || true
 log "Готово: ${node_id} (${fqdn:-$public_ip})"
 EOF
   } >"$output"
