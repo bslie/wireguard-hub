@@ -43,7 +43,7 @@ require_cmd() {
 install_dependencies() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y wireguard-tools whiptail nftables iproute2 qrencode git curl
+  apt-get install -y wireguard-tools whiptail nftables iproute2 qrencode git curl iputils-ping
 }
 
 ensure_minimal_menu_deps() {
@@ -181,7 +181,7 @@ input() {
 }
 
 menu_main() {
-  whiptail --title "WG HUB" --menu "Выберите действие" 22 100 12 \
+  whiptail --title "WG HUB" --menu "Выберите действие" 24 100 14 \
     "1" "Инициализация хаба (обязательно сначала)" \
     "2" "Добавить entry-exit (только домен VPS)" \
     "3" "Добавить exit-only (только домен VPS)" \
@@ -191,6 +191,7 @@ menu_main() {
     "7" "Сгенерировать bootstrap заново" \
     "8" "Health-check сводка" \
     "9" "Backup состояния" \
+    "t" "Статус нод (онлайн / офлайн)" \
     "0" "Выход" \
     3>&1 1>&2 2>&3
 }
@@ -705,6 +706,79 @@ regenerate_bootstrap() {
   msg "Bootstrap-скрипты пересозданы: $BOOTSTRAP_DIR"
 }
 
+show_nodes_status() {
+  sanitize_nodes_db
+  local rep hs now local_pub wg_ok
+  rep="$(mktemp)"
+  hs="$(mktemp)"
+  now="$(date +%s)"
+  wg_ok=0
+  if wg show wg-backbone dump &>/dev/null; then
+    wg_ok=1
+    wg show wg-backbone dump 2>/dev/null | awk -F'\t' 'NF == 8 { print $1 "\t" ($5 + 0) }' >"$hs"
+    local_pub="$(wg show wg-backbone dump 2>/dev/null | awk -F'\t' 'NR == 1 && NF == 4 { print $2; exit }')"
+  else
+    : >"$hs"
+    local_pub=""
+  fi
+
+  {
+    printf 'Сводка по нодам из %s\n' "$NODES_DB"
+    printf 'Эта машина: wg-backbone %s. Онлайн по туннелю: рукопожатие не старше 3 мин.\n' \
+      "$([[ "$wg_ok" -eq 1 ]] && echo "есть" || echo "не поднят (только ping)")"
+    printf 'Ping: один ICMP; если ICMP запрещён — «офлайн» не значит, что WG мёртв.\n\n'
+
+    printf '%-14s %-10s %-22s %-10s %s\n' "ID" "Роль" "Туннель (backbone)" "Ping" "Проверка (IP/домен)"
+    printf '%s\n' "------------------------------------------------------------------------------"
+
+    while IFS='|' read -r id role _ fqdn pip _ _ _ _ pub _ _ _ _; do
+      [[ -n "$id" ]] || continue
+      tun=""
+      pingst=""
+      lhs=""
+      age=0
+
+      if [[ "$wg_ok" -eq 1 && -n "$local_pub" && "$pub" == "$local_pub" ]]; then
+        tun="локально"
+      elif [[ "$wg_ok" -ne 1 ]]; then
+        tun="— (нет wg)"
+      else
+        lhs="$(awk -F'\t' -v p="$pub" '$1 == p { print $2; exit }' "$hs")"
+        if [[ -z "$lhs" ]]; then
+          tun="нет peer"
+        elif [[ "$lhs" -eq 0 ]]; then
+          tun="офлайн"
+        else
+          age=$((now - lhs))
+          if [[ "$age" -le 180 ]]; then
+            tun="онлайн (${age}s)"
+          else
+            tun="офлайн (${age}s)"
+          fi
+        fi
+      fi
+
+      ping_target="${pip:-$fqdn}"
+      if [[ -z "$ping_target" ]]; then
+        pingst="—"
+      elif command -v ping >/dev/null 2>&1; then
+        if ping -c 1 -W 2 -q "$ping_target" &>/dev/null; then
+          pingst="онлайн"
+        else
+          pingst="офлайн"
+        fi
+      else
+        pingst="нет ping"
+      fi
+
+      printf '%-14s %-10s %-22s %-10s %s\n' "$id" "$role" "$tun" "$pingst" "$ping_target"
+    done < <(tail -n +2 "$NODES_DB")
+  } >"$rep"
+
+  whiptail --title "Статус нод" --scrolltext --textbox "$rep" 26 100
+  rm -f "$rep" "$hs"
+}
+
 healthcheck() {
   local report="$OUTPUT_DIR/health-$(date +%Y%m%d-%H%M%S).txt"
   {
@@ -762,6 +836,7 @@ main() {
       7) regenerate_bootstrap ;;
       8) healthcheck ;;
       9) backup_state ;;
+      t) show_nodes_status ;;
       0) exit 0 ;;
       *) ;;
     esac
