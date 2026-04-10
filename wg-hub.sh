@@ -371,8 +371,9 @@ render_policy_routing_for_node() {
     return
   fi
   cat <<'EOF'
-ip route replace default via 10.77.0.11 dev wg-backbone table 101
-ip route replace default via 10.77.0.12 dev wg-backbone table 102
+# onlink: шлюз в /32-туннеле иначе ядро даёт «Nexthop has invalid gateway»
+ip route replace default via 10.77.0.11 dev wg-backbone onlink table 101
+ip route replace default via 10.77.0.12 dev wg-backbone onlink table 102
 ip rule add fwmark 0x65 table 101 2>/dev/null || true
 ip rule add fwmark 0x66 table 102 2>/dev/null || true
 EOF
