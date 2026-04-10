@@ -181,7 +181,7 @@ input() {
 }
 
 menu_main() {
-  whiptail --title "WG HUB" --menu "Выберите действие" 24 100 14 \
+  whiptail --title "WG HUB" --menu "Выберите действие" 26 100 16 \
     "1" "Инициализация хаба (обязательно сначала)" \
     "2" "Добавить entry-exit (только домен VPS)" \
     "3" "Добавить exit-only (только домен VPS)" \
@@ -191,6 +191,7 @@ menu_main() {
     "7" "Сгенерировать bootstrap заново" \
     "8" "Health-check сводка" \
     "9" "Backup состояния" \
+    "r" "Обновить wg-users на этом сервере из базы" \
     "t" "Статус нод (онлайн / офлайн)" \
     "0" "Выход" \
     3>&1 1>&2 2>&3
@@ -324,6 +325,51 @@ render_users_peers_for_node() {
   if [[ -f "$peers_file" ]]; then
     cat "$peers_file"
   fi
+}
+
+apply_wg_users_live_for_node() {
+  local node_id="$1"
+  local users_ip_cidr users_port users_priv users_peers stored_pub live_pub
+  [[ -f "$STATE_DIR/$node_id.users.priv" ]] || return 0
+  [[ "$(get_node_field "$node_id" 2)" == "entry-exit" ]] || return 0
+  stored_pub="$(<"$STATE_DIR/$node_id.users.pub")"
+  live_pub="$(wg show wg-users public-key 2>/dev/null || true)"
+  if [[ -n "$live_pub" && "$live_pub" != "$stored_pub" ]]; then
+    return 0
+  fi
+  if [[ -z "$live_pub" && ! -f /etc/wireguard/wg-users.conf ]]; then
+    return 0
+  fi
+  users_ip_cidr="$(get_node_field "$node_id" 11)"
+  [[ -n "$users_ip_cidr" ]] || return 0
+  users_port="$(get_node_field "$node_id" 13)"
+  users_priv="$(<"$STATE_DIR/$node_id.users.priv")"
+  users_peers="$(render_users_peers_for_node "$node_id")"
+  install -d -m 700 /etc/wireguard
+  cat >/etc/wireguard/wg-users.conf <<EOF
+[Interface]
+Address = ${users_ip_cidr}
+ListenPort = ${users_port}
+PrivateKey = ${users_priv}
+
+${users_peers}
+EOF
+  if systemctl is-enabled wg-quick@wg-users &>/dev/null; then
+    systemctl restart wg-quick@wg-users || true
+  elif command -v wg-quick >/dev/null 2>&1; then
+    wg-quick down wg-users 2>/dev/null || true
+    wg-quick up wg-users 2>/dev/null || true
+  fi
+}
+
+resync_wg_users_local() {
+  sanitize_nodes_db
+  local id
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    apply_wg_users_live_for_node "$id"
+  done < <(awk -F'|' 'NR>1 && $2=="entry-exit" {print $1}' "$NODES_DB")
+  msg "Для каждой entry-ноды проверено: если это текущий сервер (ключ wg-users), /etc/wireguard/wg-users.conf перезаписан из $SERVER_PEERS_DIR и wg-quick перезапущен."
 }
 
 ensure_nft_include_line() {
@@ -688,10 +734,12 @@ EOF
     octet=$((octet + 1))
   done
   save_meta_octet "$octet"
+  apply_wg_users_live_for_node "$msk1_id"
   if [[ "$dual_entry" -eq 1 ]]; then
-    msg "Клиент создан (MSK-1 + резерв MSK-GAMING). Файлы: $CLIENTS_DIR/$client_name"
+    apply_wg_users_live_for_node "$msk2_id"
+    msg "Клиент создан (MSK-1 + резерв MSK-GAMING). На этой машине обновлён wg-users (если это её нода).\nФайлы: $CLIENTS_DIR/$client_name\nПроверьте UDP-порт wg-users в фаерволе облака."
   else
-    msg "Клиент создан только для MSK-1. Второй конфиг появится после добавления второй entry-ноды (п.2) и п.7.\nФайлы: $CLIENTS_DIR/$client_name"
+    msg "Клиент создан для MSK-1. Конфиг wg-users на сервере обновлён и сервис перезапущен (если wg-quick@wg-users уже был настроен).\nФайлы: $CLIENTS_DIR/$client_name\nЕсли трафик не идёт: панель VPS → открыть UDP $(get_node_field "$msk1_id" 13), nftables, bootstrap для msk-1."
   fi
 }
 
@@ -894,6 +942,7 @@ main() {
       7) regenerate_bootstrap ;;
       8) healthcheck ;;
       9) backup_state ;;
+      r) resync_wg_users_local ;;
       t) show_nodes_status ;;
       0) exit 0 ;;
       *) ;;
