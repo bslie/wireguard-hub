@@ -967,7 +967,7 @@ pick_wg_iface_for_status() {
 
 show_nodes_status() {
   sanitize_nodes_db
-  local rep hs now local_pub wg_ok wg_iface
+  local rep hs now local_pub wg_ok wg_iface ts ep tun pingst lhs age ping_target
   rep="$(mktemp)"
   hs="$(mktemp)"
   now="$(date +%s)"
@@ -982,19 +982,25 @@ show_nodes_status() {
     local_pub=""
   fi
 
+  ts="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
   {
-    printf 'Сводка по нодам из %s\n' "$NODES_DB"
+    printf '\n'
+    printf '  +============================================================================================+\n'
+    printf '  |  %-88s  |\n' "СТАТУС НОД  ·  $ts"
+    printf '  +--------------------------------------------------------------------------------------------+\n'
     if [[ "$wg_ok" -eq 1 ]]; then
-      printf 'WireGuard: интерфейс «%s». Онлайн по туннелю: рукопожатие не старше 3 мин.\n' "$wg_iface"
+      printf '  |  %-88s  |\n' "WireGuard: $wg_iface  ·  онлайн по туннелю = рукопожатие не старше 3 мин"
     else
-      printf 'WireGuard: интерфейс backbone не найден (нет wg-backbone и нет iface с ключом из nodes.db).\n'
-      printf 'Запустите bootstrap на этой машине или поднимите wg-quick@wg-backbone — иначе виден только ping.\n'
+      printf '  |  %-88s  |\n' "WireGuard не найден на этой машине — колонка «Туннель» пустая; смотрите ICMP."
     fi
-    printf 'Ping: один ICMP; если ICMP запрещён — «офлайн» не значит, что WG мёртв.\n\n'
-
-    printf '%-14s %-10s %-22s %-10s %s\n' "ID" "Роль" "Туннель (backbone)" "Ping" "Проверка (IP/домен)"
-    printf '%s\n' "------------------------------------------------------------------------------"
-
+    printf '  |  %-88s  |\n' "ICMP: один ping; если ICMP режут, «нет» здесь не значит, что WG мёртв."
+    printf '  +============================================================================================+\n'
+    printf '\n'
+    printf '  Ноды:\n\n'
+    printf '  +--------------+-------------+--------------------+---------+------------------------------------+\n'
+    printf '  | %-12s | %-11s | %-18s | %-7s | %-34s |\n' "Нода" "Роль" "Туннель" "ICMP" "Endpoint"
+    printf '  +--------------+-------------+--------------------+---------+------------------------------------+\n'
     while IFS='|' read -r id role _ fqdn pip _ _ _ _ pub _ _ _ _; do
       [[ -n "$id" ]] || continue
       tun=""
@@ -1003,7 +1009,7 @@ show_nodes_status() {
       age=0
 
       if [[ "$wg_ok" -eq 1 && -n "$local_pub" && "$pub" == "$local_pub" ]]; then
-        tun="локально"
+        tun="эта машина"
       elif [[ "$wg_ok" -ne 1 ]]; then
         tun="—"
       else
@@ -1011,13 +1017,13 @@ show_nodes_status() {
         if [[ -z "$lhs" ]]; then
           tun="нет peer"
         elif [[ "$lhs" -eq 0 ]]; then
-          tun="офлайн"
+          tun="нет HS"
         else
           age=$((now - lhs))
           if [[ "$age" -le 180 ]]; then
-            tun="онлайн (${age}s)"
+            tun="онлайн ${age}с"
           else
-            tun="офлайн (${age}s)"
+            tun="давно ${age}с"
           fi
         fi
       fi
@@ -1027,19 +1033,28 @@ show_nodes_status() {
         pingst="—"
       elif command -v ping >/dev/null 2>&1; then
         if ping -c 1 -W 2 -q "$ping_target" &>/dev/null; then
-          pingst="онлайн"
+          pingst="есть"
         else
-          pingst="офлайн"
+          pingst="нет"
         fi
       else
-        pingst="нет ping"
+        pingst="n/a"
       fi
 
-      printf '%-14s %-10s %-22s %-10s %s\n' "$id" "$role" "$tun" "$pingst" "$ping_target"
+      ep="$ping_target"
+      [[ ${#ep} -gt 34 ]] && ep="${ep:0:33}…"
+      [[ ${#id} -gt 12 ]] && id="${id:0:11}…"
+      [[ ${#role} -gt 11 ]] && role="${role:0:10}…"
+      [[ ${#tun} -gt 18 ]] && tun="${tun:0:17}…"
+
+      printf '  | %-12s | %-11s | %-18s | %-7s | %-34s |\n' "$id" "$role" "$tun" "$pingst" "$ep"
     done < <(tail -n +2 "$NODES_DB")
+
+    printf '  +--------------+-------------+--------------------+---------+------------------------------------+\n'
+    printf '\n  Источник: %s\n\n' "$NODES_DB"
   } >"$rep"
 
-  whiptail --title "Статус нод" --scrolltext --textbox "$rep" 26 100
+  whiptail --title "Статус нод" --scrolltext --textbox "$rep" 34 108
   rm -f "$rep" "$hs"
 }
 
