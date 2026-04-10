@@ -170,6 +170,20 @@ msg() {
   whiptail --title "WG HUB" --msgbox "$1" 14 90
 }
 
+# Текст конфига в настоящий терминал (SSH), чтобы можно было копировать без рамок whiptail.
+dump_text_to_console() {
+  local title="$1" file="$2" out=/dev/stderr
+  [[ -w /dev/tty ]] && out=/dev/tty
+  {
+    printf '\n========== %s ==========\n\n' "$title"
+    cat "$file"
+    printf '\n\n========== конец ==========\n\n'
+  } >"$out"
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    read -r -p "Нажмите Enter, чтобы вернуться в меню… " _ </dev/tty 2>/dev/null || true
+  fi
+}
+
 input() {
   local title="$1" prompt="$2" default="${3:-}"
   local value
@@ -807,7 +821,7 @@ present_client_artifacts() {
     msg "Нет .conf для клиента $name"
     return
   fi
-  whiptail --title "Клиент $name — текст конфига (копирование)" --scrolltext --textbox "$tmp" 30 100
+  dump_text_to_console "Клиент $name — WireGuard .conf" "$tmp"
   rm -f "$tmp"
 
   list_png="$(find "$CLIENTS_DIR/$name" -maxdepth 3 -name '*.png' -type f 2>/dev/null | sort | tr '\n' ' ')"
@@ -845,7 +859,7 @@ browse_client_config_ui() {
   fi
   tmp="$(mktemp)"
   cat "$f" >"$tmp"
-  whiptail --title "$(basename "$f")" --scrolltext --textbox "$tmp" 30 100
+  dump_text_to_console "$(basename "$f")" "$tmp"
   rm -f "$tmp"
   msg "Полный путь конфига:\n$f\n\nQR PNG:\n${f%.conf}.png"
 }
