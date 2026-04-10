@@ -185,16 +185,33 @@ menu_main() {
     "1" "Инициализация хаба (обязательно сначала)" \
     "2" "Добавить entry-exit (только домен VPS)" \
     "3" "Добавить exit-only (только домен VPS)" \
-    "4" "Создать клиента (1-2 устройства)" \
-    "5" "Показать QR существующего клиента" \
-    "6" "Открыть файлы списков FRA/AMS" \
-    "7" "Сгенерировать bootstrap заново" \
-    "8" "Health-check сводка" \
-    "9" "Backup состояния" \
+    "4" "Пользователи WireGuard (клиенты)" \
+    "5" "Открыть файлы списков FRA/AMS" \
+    "6" "Сгенерировать bootstrap заново" \
+    "7" "Health-check сводка" \
+    "8" "Backup состояния" \
     "r" "Обновить wg-users на этом сервере из базы" \
     "t" "Статус нод (онлайн / офлайн)" \
     "0" "Выход" \
     3>&1 1>&2 2>&3
+}
+
+menu_clients() {
+  while true; do
+    local mc
+    mc="$(whiptail --title "Пользователи" --menu "Клиенты WireGuard" 20 78 10 \
+      "1" "Создать клиента (1–2 устройства)" \
+      "2" "Показать конфиг (текст) + QR в PNG" \
+      "3" "Список клиентов" \
+      "0" "Назад" \
+      3>&1 1>&2 2>&3)" || break
+    case "$mc" in
+      1) create_client ;;
+      2) browse_client_config_ui ;;
+      3) list_clients_menu ;;
+      0|"") break ;;
+    esac
+  done
 }
 
 node_exists() {
@@ -725,36 +742,99 @@ PublicKey = ${dev_pub}
 AllowedIPs = 10.88.${vlan2}.${octet}/32
 
 EOF
-      qrencode -t ANSIUTF8 <"$dir/${dev_name}-MSKGAMING.conf" || true
     fi
 
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$client_name" "$i" "$client_name" "$dev_name" "$dev_priv" "$dev_pub" "$octet" "$now" >>"$CLIENTS_DB"
 
-    qrencode -t ANSIUTF8 <"$dir/${dev_name}-MSK1.conf" || true
     octet=$((octet + 1))
   done
   save_meta_octet "$octet"
   apply_wg_users_live_for_node "$msk1_id"
   if [[ "$dual_entry" -eq 1 ]]; then
     apply_wg_users_live_for_node "$msk2_id"
-    msg "Клиент создан (MSK-1 + резерв MSK-GAMING). На этой машине обновлён wg-users (если это её нода).\nФайлы: $CLIENTS_DIR/$client_name\nПроверьте UDP-порт wg-users в фаерволе облака."
+  fi
+  present_client_artifacts "$client_name"
+  if [[ "$dual_entry" -eq 1 ]]; then
+    msg "MSK-1 + резерв MSK-GAMING. wg-users обновлён на подходящих нодах.\nUDP wg-users откройте в фаерволе облака."
   else
-    msg "Клиент создан для MSK-1. Конфиг wg-users на сервере обновлён и сервис перезапущен (если wg-quick@wg-users уже был настроен).\nФайлы: $CLIENTS_DIR/$client_name\nЕсли трафик не идёт: панель VPS → открыть UDP $(get_node_field "$msk1_id" 13), nftables, bootstrap для msk-1."
+    msg "Только MSK-1. Если трафик не идёт: UDP $(get_node_field "$msk1_id" 13) у провайдера, nftables, bootstrap msk-1."
   fi
 }
 
-show_client_qr() {
-  local client_name
-  client_name="$(input "QR" "Имя клиента" "")"
-  local dir
-  dir="$CLIENTS_DIR/$client_name"
-  if [[ ! -d "$dir" ]]; then
-    msg "Не найдено: $dir"
+present_client_artifacts() {
+  local name="$1" tmp f list_png
+  tmp="$(mktemp)"
+  : >"$tmp"
+  while IFS= read -r f; do
+    printf '\n# ----- %s -----\n\n' "$(basename "$f")" >>"$tmp"
+    cat "$f" >>"$tmp"
+    printf '\n' >>"$tmp"
+    if command -v qrencode >/dev/null 2>&1; then
+      qrencode -t PNG -o "${f%.conf}.png" <"$f" 2>/dev/null || true
+    fi
+  done < <(find "$CLIENTS_DIR/$name" -name '*.conf' -type f 2>/dev/null | sort)
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    msg "Нет .conf для клиента $name"
     return
   fi
-  while IFS= read -r conf; do
-    qrencode -t ANSIUTF8 <"$conf" || true
-  done < <(find "$dir" -type f -name "*.conf" | sort)
+  whiptail --title "Клиент $name — текст конфига (копирование)" --scrolltext --textbox "$tmp" 30 100
+  rm -f "$tmp"
+
+  list_png="$(find "$CLIENTS_DIR/$name" -maxdepth 3 -name '*.png' -type f 2>/dev/null | sort | tr '\n' ' ')"
+  msg "Файлы:\n$CLIENTS_DIR/$name/\n\nQR (PNG), откройте на сервере или scp:\n${list_png:-—}"
+}
+
+browse_client_config_ui() {
+  local name args i sel f tmp
+  name="$(input "Клиент" "Имя клиента (каталог в output/clients)" "")"
+  [[ -n "$name" ]] || return
+  if [[ ! -d "$CLIENTS_DIR/$name" ]]; then
+    msg "Нет каталога: $CLIENTS_DIR/$name"
+    return
+  fi
+
+  mapfile -t _client_confs < <(find "$CLIENTS_DIR/$name" -name '*.conf' -type f | sort)
+  if [[ "${#_client_confs[@]}" -eq 0 ]]; then
+    msg "В каталоге нет .conf"
+    return
+  fi
+
+  if [[ "${#_client_confs[@]}" -eq 1 ]]; then
+    f="${_client_confs[0]}"
+  else
+    args=()
+    for i in "${!_client_confs[@]}"; do
+      args+=("$i" "$(basename "${_client_confs[$i]}")")
+    done
+    sel="$(whiptail --title "Конфиг" --menu "Выберите файл" 22 70 12 "${args[@]}" 3>&1 1>&2 2>&3)" || return
+    f="${_client_confs[$sel]}"
+  fi
+
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t PNG -o "${f%.conf}.png" <"$f" 2>/dev/null || true
+  fi
+  tmp="$(mktemp)"
+  cat "$f" >"$tmp"
+  whiptail --title "$(basename "$f")" --scrolltext --textbox "$tmp" 30 100
+  rm -f "$tmp"
+  msg "Полный путь конфига:\n$f\n\nQR PNG:\n${f%.conf}.png"
+}
+
+list_clients_menu() {
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "База $CLIENTS_DB (имя | устройство | октет | время):"
+    echo "----------------------------------------------------------------"
+    awk -F'|' 'NR>1 { printf "%-18s %-22s %-6s %s\n", $1, $4, $7, $8 }' "$CLIENTS_DB" 2>/dev/null || true
+    echo
+    echo "Каталоги в $CLIENTS_DIR:"
+    ls -1 "$CLIENTS_DIR" 2>/dev/null || echo "(пусто)"
+  } >"$tmp"
+  whiptail --title "Список клиентов" --scrolltext --textbox "$tmp" 28 100
+  rm -f "$tmp"
 }
 
 open_lists_hint() {
@@ -936,12 +1016,11 @@ main() {
       1) init_hub ;;
       2) create_or_update_node "entry-exit" ;;
       3) create_or_update_node "exit-only" ;;
-      4) create_client ;;
-      5) show_client_qr ;;
-      6) open_lists_hint ;;
-      7) regenerate_bootstrap ;;
-      8) healthcheck ;;
-      9) backup_state ;;
+      4) menu_clients ;;
+      5) open_lists_hint ;;
+      6) regenerate_bootstrap ;;
+      7) healthcheck ;;
+      8) backup_state ;;
       r) resync_wg_users_local ;;
       t) show_nodes_status ;;
       0) exit 0 ;;
