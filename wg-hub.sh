@@ -12,9 +12,44 @@ BACKUP_DIR="$WG_HUB_HOME/backups"
 NODES_DB="$STATE_DIR/nodes.db"
 CLIENTS_DB="$STATE_DIR/clients.db"
 META_ENV="$STATE_DIR/meta.env"
+JOIN_BUNDLE_DIR="$OUTPUT_DIR/join-bundles"
 
 log() { printf '[wg-hub] %s\n' "$*"; }
 err() { printf '[wg-hub][error] %s\n' "$*" >&2; }
+
+# ANSI: только на TTY (подсветка меню и фрагментов конфигов).
+if [[ -t 2 ]]; then
+  C_HEAD=$'\033[1;36m'
+  C_OK=$'\033[1;32m'
+  C_WARN=$'\033[1;33m'
+  C_ERR=$'\033[1;31m'
+  C_KEY=$'\033[33m'
+  C_SEC=$'\033[35m'
+  C_DIM=$'\033[0;90m'
+  C_RESET=$'\033[0m'
+else
+  C_HEAD='' C_OK='' C_WARN='' C_ERR='' C_KEY='' C_SEC='' C_DIM='' C_RESET=''
+fi
+
+ui_tty() {
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s' /dev/tty
+  else
+    printf '%s' /dev/stderr
+  fi
+}
+
+ui_print() {
+  # печать в интерактивный терминал (меню не попадает в stdout при $(capture))
+  printf '%b\n' "$*" >"$(ui_tty)"
+}
+
+ui_pause() {
+  local tty
+  tty="$(ui_tty)"
+  [[ -r "$tty" && -w "$tty" ]] || return 0
+  read -r -p "$(printf '%b' "${C_DIM}[Enter] — дальше…${C_RESET} ")" _ <"$tty" 2>/dev/null || true
+}
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -43,19 +78,15 @@ require_cmd() {
 install_dependencies() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y wireguard-tools whiptail nftables iproute2 qrencode git curl iputils-ping
+  apt-get install -y wireguard-tools nftables iproute2 qrencode git curl iputils-ping
 }
 
 ensure_minimal_menu_deps() {
-  if ! command -v whiptail >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y whiptail
-  fi
+  :
 }
 
 init_layout() {
-  mkdir -p "$STATE_DIR" "$LISTS_DIR" "$BOOTSTRAP_DIR" "$CLIENTS_DIR" "$SERVER_PEERS_DIR" "$BACKUP_DIR"
+  mkdir -p "$STATE_DIR" "$LISTS_DIR" "$BOOTSTRAP_DIR" "$JOIN_BUNDLE_DIR" "$CLIENTS_DIR" "$SERVER_PEERS_DIR" "$BACKUP_DIR"
   touch "$LISTS_DIR/fra_domains.txt" "$LISTS_DIR/fra_ips.txt" "$LISTS_DIR/ams_domains.txt" "$LISTS_DIR/ams_ips.txt"
 
   if [[ ! -f "$NODES_DB" ]]; then
@@ -167,27 +198,70 @@ sanitize_nodes_db() {
 }
 
 msg() {
-  whiptail --title "WG HUB" --msgbox "$1" 14 90
+  ui_print "${C_OK}${1}${C_RESET}"
+  ui_pause
 }
 
-# Текст конфига в настоящий терминал (SSH), чтобы можно было копировать без рамок whiptail.
+confirm_yes() {
+  local prompt="$1" tty ans
+  tty="$(ui_tty)"
+  [[ -r "$tty" && -w "$tty" ]] || return 1
+  printf '%b\n' "${C_WARN}${prompt}${C_RESET}"
+  printf '%s' "[y/N]: " >"$tty"
+  read -r ans <"$tty" 2>/dev/null || return 1
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+# Простая подсветка строк WireGuard-конфига (секции / ключи).
+hl_wg_cat() {
+  local out="$1"
+  local line sec key rest
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == \[*] ]]; then
+      printf '%b\n' "${C_HEAD}${line}${C_RESET}" >"$out"
+    elif [[ "$line" =~ ^(PrivateKey|PreSharedKey)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      rest="${BASH_REMATCH[2]}"
+      printf '%b\n' "${C_SEC}${key}${C_RESET} = ${C_KEY}${rest}${C_RESET}" >"$out"
+    elif [[ "$line" =~ ^(PublicKey)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      rest="${BASH_REMATCH[2]}"
+      printf '%b\n' "${C_SEC}${key}${C_RESET} = ${C_KEY}${rest}${C_RESET}" >"$out"
+    else
+      printf '%s\n' "$line" >"$out"
+    fi
+  done
+}
+
+# Текст конфига в SSH-терминал: копирование без полноэкранных окон.
 dump_text_to_console() {
-  local title="$1" file="$2" out=/dev/stderr
-  [[ -w /dev/tty ]] && out=/dev/tty
+  local title="$1" file="$2" out
+  out="$(ui_tty)"
   {
     printf '\n========== %s ==========\n\n' "$title"
-    cat "$file"
+    if [[ -t 2 ]] || [[ "$out" == /dev/tty ]]; then
+      hl_wg_cat "$out" <"$file"
+    else
+      cat "$file"
+    fi
     printf '\n\n========== конец ==========\n\n'
   } >"$out"
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    read -r -p "Нажмите Enter, чтобы вернуться в меню… " _ </dev/tty 2>/dev/null || true
-  fi
+  ui_pause
 }
 
 input() {
   local title="$1" prompt="$2" default="${3:-}"
-  local value
-  value="$(whiptail --title "$title" --inputbox "$prompt" 12 90 "$default" 3>&1 1>&2 2>&3)"
+  local value tty
+  tty="$(ui_tty)"
+  ui_print "${C_HEAD}[$title]${C_RESET} $prompt"
+  if [[ -n "$default" ]]; then
+    ui_print "${C_DIM}По умолчанию:${C_RESET} $default ${C_DIM}(Enter — принять)${C_RESET}"
+  fi
+  printf '%b' "${C_DIM}> ${C_RESET}" >"$tty"
+  read -r value <"$tty" || true
+  if [[ -z "$value" && -n "$default" ]]; then
+    value="$default"
+  fi
   # Убираем CR/управляющие символы: они ломают nodes.db и bootstrap.
   printf '%s' "$value" \
     | tr -d '\r' \
@@ -195,33 +269,96 @@ input() {
 }
 
 menu_main() {
-  whiptail --title "WG HUB" --menu "Корень: хаб, ноды, клиенты (п.4), bootstrap, диагностика. Нужен root, Debian 13." 27 100 16 \
-    "1" "Инициализация хаба (обязательно сначала)" \
-    "2" "Добавить entry-exit (только домен VPS)" \
-    "3" "Добавить exit-only (только домен VPS)" \
-    "4" "Пользователи WireGuard (клиенты)" \
-    "5" "Открыть файлы списков FRA/AMS" \
-    "6" "Сгенерировать bootstrap заново" \
-    "7" "Health-check сводка" \
-    "8" "Backup состояния" \
-    "r" "Обновить wg-users на этом сервере из базы" \
-    "t" "Статус нод (онлайн / офлайн)" \
-    "0" "Выход" \
-    3>&1 1>&2 2>&3
+  local c tty
+  tty="$(ui_tty)"
+  {
+    printf '%b\n' "${C_HEAD}=== WG HUB — главное меню ===${C_RESET}"
+    printf '%s\n' "Root, Debian 13. Каталог: $WG_HUB_HOME"
+    printf '%s\n' ""
+    printf '%s\n' "  1) Хаб — первичная инициализация (MSK-1)"
+    printf '%s\n' "  2) Ноды — добавить, удалить, join с Git, статус"
+    printf '%s\n' "  3) Клиенты WireGuard"
+    printf '%s\n' "  4) Списки FRA / AMS (куда править файлы)"
+    printf '%s\n' "  5) Служебное — пересборка, wg-users, health, backup, URL join"
+    printf '%s\n' "  0) Выход"
+    printf '%b' "${C_DIM}Пункт: ${C_RESET}"
+  } >"$tty"
+  read -r c <"$tty" || c=""
+  printf '%s' "$c"
+}
+
+menu_nodes() {
+  local mc tty
+  tty="$(ui_tty)"
+  while true; do
+    {
+      printf '%b\n' "${C_HEAD}=== Ноды ===${C_RESET}"
+      printf '%s\n' "  1) Добавить entry-exit (FQDN новой VPS)"
+      printf '%s\n' "  2) Добавить exit-only"
+      printf '%s\n' "  3) Статус нод (WireGuard + ICMP)"
+      printf '%s\n' "  4) Удалить ноду"
+      printf '%s\n' "  5) Повторить команды join (scp + curl из Git)"
+      printf '%s\n' "  6) Задать URL raw scripts/node-join.sh (GitHub)"
+      printf '%s\n' "  0) Назад"
+      printf '%b' "${C_DIM}Пункт: ${C_RESET}"
+    } >"$tty"
+    read -r mc <"$tty" || break
+    case "$mc" in
+      1) create_or_update_node "entry-exit" ;;
+      2) create_or_update_node "exit-only" ;;
+      3) show_nodes_status ;;
+      4) delete_node_interactive ;;
+      5) menu_reprint_join_commands ;;
+      6) configure_join_script_url ;;
+      0|"") break ;;
+    esac
+  done
+}
+
+menu_service() {
+  local mc tty
+  tty="$(ui_tty)"
+  while true; do
+    {
+      printf '%b\n' "${C_HEAD}=== Служебное ===${C_RESET}"
+      printf '%s\n' "  1) Пересобрать все bootstrap + join-bundle"
+      printf '%s\n' "  2) Обновить wg-users на этом сервере из базы"
+      printf '%s\n' "  3) Health-check (файл в output/)"
+      printf '%s\n' "  4) Backup state + output"
+      printf '%s\n' "  5) URL raw node-join.sh (Git)"
+      printf '%s\n' "  0) Назад"
+      printf '%b' "${C_DIM}Пункт: ${C_RESET}"
+    } >"$tty"
+    read -r mc <"$tty" || break
+    case "$mc" in
+      1) regenerate_bootstrap ;;
+      2) resync_wg_users_local ;;
+      3) healthcheck ;;
+      4) backup_state ;;
+      5) configure_join_script_url ;;
+      0|"") break ;;
+    esac
+  done
 }
 
 menu_clients() {
+  local mc tty
+  tty="$(ui_tty)"
   while true; do
-    local mc
-    mc="$(whiptail --title "Пользователи WireGuard" --menu "Клиенты: создать, смотреть конфиг/QR, список, удалить, синхронизировать пиры с базой, экспорт. На другой entry-VPS после изменений скопируйте state/ или повторите синхронизацию там." 28 92 16 \
-      "1" "Создать клиента (1–2 устройства)" \
-      "2" "Просмотр конфига (текст) + QR PNG" \
-      "3" "Список клиентов и устройств" \
-      "4" "Удалить клиента" \
-      "5" "Пересобрать пиры из базы + wg-users" \
-      "6" "Экспорт клиента в .tar.gz" \
-      "0" "Назад" \
-      3>&1 1>&2 2>&3)" || break
+    {
+      printf '%b\n' "${C_HEAD}=== Клиенты WireGuard ===${C_RESET}"
+      printf '%s\n' "На другой entry-VPS после изменений скопируйте state/ или повторите синхронизацию там."
+      printf '%s\n' ""
+      printf '%s\n' "  1) Создать клиента (1–2 устройства)"
+      printf '%s\n' "  2) Просмотр конфига (текст) + QR PNG"
+      printf '%s\n' "  3) Список клиентов и устройств"
+      printf '%s\n' "  4) Удалить клиента"
+      printf '%s\n' "  5) Пересобрать пиры из базы + wg-users"
+      printf '%s\n' "  6) Экспорт клиента в .tar.gz"
+      printf '%s\n' "  0) Назад"
+      printf '%b' "${C_DIM}Пункт: ${C_RESET}"
+    } >"$tty"
+    read -r mc <"$tty" || break
     case "$mc" in
       1) create_client ;;
       2) browse_client_config_ui ;;
@@ -279,6 +416,251 @@ get_node_field() {
 list_nodes_by_role() {
   local role="$1"
   awk -F'|' -v role="$role" 'NR>1 && $2==role {print $1}' "$NODES_DB"
+}
+
+get_join_script_url() {
+  if [[ -n "${WG_HUB_JOIN_SCRIPT_URL:-}" ]]; then
+    printf '%s' "$WG_HUB_JOIN_SCRIPT_URL"
+    return 0
+  fi
+  if [[ -f "$STATE_DIR/join-script-url.txt" ]]; then
+    head -1 "$STATE_DIR/join-script-url.txt" | tr -d '\r'
+    return 0
+  fi
+  printf '%s' "https://raw.githubusercontent.com/YOUR_ORG/wireguard-hub/main/scripts/node-join.sh"
+}
+
+configure_join_script_url() {
+  local cur v
+  cur="$(get_join_script_url)"
+  v="$(input "Git raw URL" "Полный URL к scripts/node-join.sh (страница raw на GitHub)" "$cur")"
+  [[ -n "$v" ]] || return
+  printf '%s\n' "$v" >"$STATE_DIR/join-script-url.txt"
+  msg "Сохранено: $STATE_DIR/join-script-url.txt"
+}
+
+write_join_bundle_for_node() {
+  local node_id="$1"
+  local out="$JOIN_BUNDLE_DIR/join-${node_id}.bash"
+  local role fqdn public_ip iface bb_ip bb_port bb_priv bb_pub users_ip_cidr users_subnet users_port
+  local peers peers_b64 users_peers users_peers_b64 policy policy_b64 users_priv
+
+  role="$(get_node_field "$node_id" 2)"
+  fqdn="$(get_node_field "$node_id" 4)"
+  public_ip="$(get_node_field "$node_id" 5)"
+  iface="$(get_node_field "$node_id" 6)"
+  bb_ip="$(get_node_field "$node_id" 7)"
+  bb_port="$(get_node_field "$node_id" 8)"
+  bb_priv="$(get_node_field "$node_id" 9)"
+  bb_pub="$(get_node_field "$node_id" 10)"
+  users_ip_cidr="$(get_node_field "$node_id" 11)"
+  users_subnet="$(get_node_field "$node_id" 12)"
+  users_port="$(get_node_field "$node_id" 13)"
+
+  peers="$(render_backbone_peers_for_node "$node_id")"
+  peers_b64="$(printf '%s' "$peers" | base64 -w0)"
+  users_peers_b64=""
+  policy_b64=""
+  users_priv=""
+  if [[ "$role" == "entry-exit" ]]; then
+    [[ -f "$STATE_DIR/$node_id.users.priv" ]] && users_priv="$(<"$STATE_DIR/$node_id.users.priv")"
+    users_peers="$(render_users_peers_for_node "$node_id")"
+    users_peers_b64="$(printf '%s' "$users_peers" | base64 -w0)"
+    policy="$(render_policy_routing_for_node "$node_id")"
+    policy_b64="$(printf '%s' "$policy" | base64 -w0)"
+  fi
+
+  cat >"$out" <<EOF
+# Автогенерация wg-hub — не править вручную. Источник: node ${node_id}
+WG_JOIN_SCHEMA=1
+WG_JOIN_ROLE='${role}'
+WG_JOIN_NODE_ID='${node_id}'
+WG_JOIN_FQDN='${fqdn}'
+WG_JOIN_PUBLIC_IP='${public_ip}'
+WG_JOIN_IFACE='${iface}'
+WG_JOIN_BB_IP='${bb_ip}'
+WG_JOIN_BB_PORT='${bb_port}'
+WG_JOIN_BB_PRIV='${bb_priv}'
+WG_JOIN_BB_PUB='${bb_pub}'
+WG_JOIN_USERS_IP_CIDR='${users_ip_cidr}'
+WG_JOIN_USERS_SUBNET='${users_subnet}'
+WG_JOIN_USERS_PORT='${users_port}'
+WG_JOIN_USERS_PRIV='${users_priv}'
+WG_JOIN_BACKBONE_PEERS_B64='${peers_b64}'
+WG_JOIN_USERS_PEERS_B64='${users_peers_b64}'
+WG_JOIN_POLICY_ROUTES_B64='${policy_b64}'
+EOF
+  chmod 600 "$out"
+}
+
+write_all_join_bundles() {
+  local id
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    write_join_bundle_for_node "$id"
+  done < <(awk -F'|' 'NR>1 {print $1}' "$NODES_DB")
+}
+
+regenerate_all_bootstraps_and_bundles() {
+  sanitize_nodes_db
+  awk -F'|' 'NR>1 {print $1 "|" $2}' "$NODES_DB" | while IFS='|' read -r id r; do
+    if [[ "$r" == "entry-exit" ]]; then
+      render_bootstrap_entry_exit "$id" "$BOOTSTRAP_DIR/bootstrap-$id.sh"
+    else
+      render_bootstrap_exit_only "$id" "$BOOTSTRAP_DIR/bootstrap-$id.sh"
+    fi
+  done
+  write_all_join_bundles
+}
+
+print_join_instructions_tty() {
+  local node_id="$1" url bundle fqdn
+  url="$(get_join_script_url)"
+  bundle="$JOIN_BUNDLE_DIR/join-${node_id}.bash"
+  fqdn="$(get_node_field "$node_id" 4)"
+  [[ -f "$bundle" ]] || {
+    err "Нет join-bundle: $bundle"
+    return 1
+  }
+  ui_print ""
+  ui_print "${C_HEAD}── Команды на новой VPS (${node_id}, ${fqdn}) ──${C_RESET}"
+  ui_print ""
+  ui_print "${C_DIM}1) Скопируйте bundle с этой машины (хаба):${C_RESET}"
+  ui_print "   ${C_KEY}scp ${bundle} root@${fqdn}:/root/join-${node_id}.bash${C_RESET}"
+  ui_print ""
+  ui_print "${C_DIM}2) На VPS скачайте node-join.sh из Git и выполните:${C_RESET}"
+  ui_print "   ${C_KEY}curl -fsSL '${url}' -o /root/node-join.sh && chmod +x /root/node-join.sh${C_RESET}"
+  ui_print "   ${C_KEY}bash /root/node-join.sh /root/join-${node_id}.bash${C_RESET}"
+  ui_print ""
+}
+
+resolve_local_node_id_from_wg() {
+  local wg_iface pub
+  wg_iface="$(pick_wg_iface_for_status 2>/dev/null)" || return 1
+  pub="$(wg show "$wg_iface" dump 2>/dev/null | awk -F'\t' 'NR == 1 && NF == 4 { print $2; exit }')"
+  [[ -n "$pub" ]] || return 1
+  awk -F'|' -v p="$pub" 'NR>1 && $10==p {print $1; exit}' "$NODES_DB"
+}
+
+prompt_apply_local_bootstrap_if_needed() {
+  local nid
+  nid="$(resolve_local_node_id_from_wg 2>/dev/null)" || return 0
+  node_exists "$nid" || return 0
+  if confirm_yes "Сервер совпадает с нодой «$nid» в базе. Применить сейчас $BOOTSTRAP_DIR/bootstrap-${nid}.sh (обновить живой WireGuard и пиров)?"; then
+    bash "$BOOTSTRAP_DIR/bootstrap-$nid.sh" || msg "Ошибка bootstrap — запустите вручную на этом хосте."
+  fi
+}
+
+wait_for_node_peer_connected() {
+  local node_id="$1"
+  local max_sec="${2:-900}"
+  local pub wg_iface hs_ts now start age
+  pub="$(get_node_field "$node_id" 10)"
+  [[ -n "$pub" ]] || return 0
+  if ! wg_iface="$(pick_wg_iface_for_status 2>/dev/null)"; then
+    ui_print "${C_WARN}На этом хосте не найден wg-backbone из базы — авто-ожидание пропущено. Проверьте статус нод с машины-хаба с поднятым туннелем.${C_RESET}"
+    ui_pause
+    return 0
+  fi
+  start="$(date +%s)"
+  ui_print "${C_WARN}Ожидание подключения ноды «${node_id}»…${C_RESET}"
+  ui_print "${C_DIM}После запуска node-join на новой VPS здесь появится успех (рукопожатие WireGuard ≤3 мин). Ctrl+C — выйти из ожидания.${C_RESET}"
+  while true; do
+    hs_ts="$(wg show "$wg_iface" dump 2>/dev/null | awk -F'\t' -v p="$pub" '$1 == p && NF == 8 { print ($5 + 0); exit }')"
+    now="$(date +%s)"
+    if [[ -n "$hs_ts" && "$hs_ts" -ne 0 ]]; then
+      age=$((now - hs_ts))
+      if [[ "$age" -le 180 ]]; then
+        printf '\r%*s\r' 80 '' >"$(ui_tty)"
+        ui_print "${C_OK}Подключение выполнено успешно: «${node_id}», рукопожатие ${age} с назад.${C_RESET}"
+        ui_pause
+        return 0
+      fi
+    fi
+    if [[ $((now - start)) -ge "$max_sec" ]]; then
+      printf '\r%*s\r' 80 '' >"$(ui_tty)"
+      ui_print "${C_ERR}Таймаут ожидания (${max_sec} с). Проверьте node-join на ноде, UDP-порт, фаервол и что на хабе применён актуальный bootstrap.${C_RESET}"
+      ui_pause
+      return 1
+    fi
+    printf '\r  %s… %s с ' "${node_id}" "$((now - start))" >"$(ui_tty)"
+    sleep 3
+  done
+}
+
+pick_node_id_interactive() {
+  local title="$1" lines tty sel i id role fqdn
+  tty="$(ui_tty)"
+  sanitize_nodes_db
+  mapfile -t lines < <(awk -F'|' 'NR>1 { printf "%s|%s|%s\n", $1, $2, $4 }' "$NODES_DB")
+  if [[ "${#lines[@]}" -eq 0 ]]; then
+    msg "В базе нет нод."
+    return 1
+  fi
+  {
+    printf '%b\n' "${C_HEAD}$title${C_RESET}"
+    for i in "${!lines[@]}"; do
+      IFS='|' read -r id role fqdn <<<"${lines[$i]}"
+      printf '%3s) %-16s %-12s %s\n' "$i" "$id" "$role" "$fqdn"
+    done
+    printf '%b' "${C_DIM}Номер или id: ${C_RESET}"
+  } >"$tty"
+  read -r sel <"$tty" || return 1
+  if [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -ge 0 && "$sel" -lt "${#lines[@]}" ]]; then
+    IFS='|' read -r id _ _ <<<"${lines[$sel]}"
+    printf '%s' "$id"
+    return 0
+  fi
+  printf '%s' "$sel"
+}
+
+delete_node_by_id() {
+  local node_id="$1"
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v id="$node_id" 'NR==1 || $1!=id' "$NODES_DB" >"$tmp"
+  mv "$tmp" "$NODES_DB"
+  rm -f \
+    "$STATE_DIR/${node_id}.users.priv" \
+    "$STATE_DIR/${node_id}.users.pub" \
+    "$STATE_DIR/${node_id}.backbone.pub" \
+    "$BOOTSTRAP_DIR/bootstrap-${node_id}.sh" \
+    "$JOIN_BUNDLE_DIR/join-${node_id}.bash" \
+    "$SERVER_PEERS_DIR/${node_id}.peers.conf"
+  sanitize_nodes_db
+  regenerate_all_bootstraps_and_bundles
+  repair_peers_and_wg_users_from_db
+}
+
+delete_node_interactive() {
+  local nid
+  nid="$(pick_node_id_interactive "Удалить ноду")" || return
+  [[ -n "$nid" ]] || return
+  if [[ "$nid" == "msk-1" ]]; then
+    msg "Ноду msk-1 (корневой хаб) нельзя удалить из этого меню."
+    return
+  fi
+  if ! node_exists "$nid"; then
+    msg "Ноды «$nid» нет в базе."
+    return
+  fi
+  if ! confirm_yes "Удалить «$nid» из nodes.db и с диска (ключи, bootstrap, join-bundle, server-peers)? Остальные ноды будут пересобраны."; then
+    return
+  fi
+  delete_node_by_id "$nid"
+  msg "Нода «$nid» удалена, артефакты пересобраны."
+}
+
+menu_reprint_join_commands() {
+  local nid
+  nid="$(pick_node_id_interactive "Повторить инструкции join")" || return
+  [[ -n "$nid" ]] || return
+  if [[ ! -f "$JOIN_BUNDLE_DIR/join-${nid}.bash" ]]; then
+    msg "Нет join-${nid}.bash — выполните «Пересобрать bootstrap + join-bundle» в служебном меню."
+    return
+  fi
+  print_join_instructions_tty "$nid"
+  ui_pause
 }
 
 save_meta_octet() {
@@ -656,6 +1038,8 @@ create_or_update_node() {
   local role="$1"
   local node_id fqdn public_ip iface bb_ip bb_port reserve now keys bb_priv bb_pub users_ip_cidr users_subnet users_port ukeys users_priv users_pub vlan
 
+  ui_print "${C_DIM}Ключи генерируются на хабе: локальный bootstrap-*.sh и файл join-*.bash (для scripts/node-join.sh из Git). На VPS удобнее curl+join; bootstrap остаётся как один самодостаточный .sh.${C_RESET}"
+  ui_pause
   fqdn="$(input "Нода" "Домен новой VPS (FQDN) — остальное подставится само" "")"
   if ! valid_fqdn "$fqdn"; then
     msg "Некорректный домен (FQDN)."
@@ -692,31 +1076,38 @@ create_or_update_node() {
     printf '%s\n' "$users_priv" >"$STATE_DIR/$node_id.users.priv"
     printf '%s\n' "$users_pub" >"$STATE_DIR/$node_id.users.pub"
     upsert_node "$node_id|entry-exit|$reserve|$fqdn|$public_ip|$iface|$bb_ip|$bb_port|$bb_priv|$bb_pub|$users_ip_cidr|$users_subnet|$users_port|$now"
-    render_bootstrap_entry_exit "$node_id" "$BOOTSTRAP_DIR/bootstrap-$node_id.sh"
-    msg "Готово: $node_id → $BOOTSTRAP_DIR/bootstrap-$node_id.sh\nbackbone ${bb_ip}, users ${users_ip_cidr}, порт ${users_port}"
   else
     bb_ip="$(allocate_bb_for_exit_only)"
     upsert_node "$node_id|exit-only|no|$fqdn|$public_ip|$iface|$bb_ip|$bb_port|$bb_priv|$bb_pub|||0|$now"
-    render_bootstrap_exit_only "$node_id" "$BOOTSTRAP_DIR/bootstrap-$node_id.sh"
-    msg "Готово: $node_id → $BOOTSTRAP_DIR/bootstrap-$node_id.sh\nbackbone ${bb_ip}"
   fi
 
-  sanitize_nodes_db
-  # Пересобрать bootstrap для всех нод (хаб + спицы).
-  awk -F'|' 'NR>1 {print $1 "|" $2}' "$NODES_DB" | while IFS='|' read -r id r; do
-    if [[ "$r" == "entry-exit" ]]; then
-      render_bootstrap_entry_exit "$id" "$BOOTSTRAP_DIR/bootstrap-$id.sh"
-    else
-      render_bootstrap_exit_only "$id" "$BOOTSTRAP_DIR/bootstrap-$id.sh"
-    fi
-  done
+  regenerate_all_bootstraps_and_bundles
+  ui_print "${C_OK}Нода ${node_id} добавлена.${C_RESET}"
+  if [[ "$role" == "entry-exit" ]]; then
+    ui_print "entry-exit · backbone ${bb_ip} · users ${users_ip_cidr} · wg-users UDP ${users_port}"
+  else
+    ui_print "exit-only · backbone ${bb_ip} · backbone UDP ${bb_port}"
+  fi
+  ui_print "Публичный ключ backbone: ${bb_pub}"
+  ui_print "Артефакты: ${BOOTSTRAP_DIR}/bootstrap-${node_id}.sh · ${JOIN_BUNDLE_DIR}/join-${node_id}.bash"
+  print_join_instructions_tty "$node_id"
+  prompt_apply_local_bootstrap_if_needed
+  wait_for_node_peer_connected "$node_id"
 }
 
 create_client() {
   local client_name count i octet now dev_name keys dev_priv dev_pub msk1_id msk2_id msk1_ep msk2_ep msk1_port msk2_port
-  local dir ip1 ip2 msk1_pub msk2_pub msk2_net vlan2 dual_entry
+  local dir ip1 ip2 msk1_pub msk2_pub msk2_net vlan2 dual_entry tty
+  tty="$(ui_tty)"
   client_name="$(input "Клиент" "Имя клиента (латиницей)" "")"
-  count="$(whiptail --title "Клиент" --menu "Сколько устройств?" 12 60 2 "1" "Одно устройство" "2" "Два устройства" 3>&1 1>&2 2>&3)"
+  {
+    printf '%b\n' "${C_HEAD}Сколько устройств?${C_RESET}"
+    printf '%s\n' "  1) Одно устройство"
+    printf '%s\n' "  2) Два устройства"
+    printf '%b' "${C_DIM}Пункт: ${C_RESET}"
+  } >"$tty"
+  read -r count <"$tty" || count="1"
+  [[ "$count" =~ ^[12]$ ]] || count="1"
   msk1_id="msk-1"
   msk2_id="$(awk -F'|' 'NR>1 && $2=="entry-exit" && $1!="msk-1" {print $1; exit}' "$NODES_DB")"
   if ! node_exists "$msk1_id"; then
@@ -829,7 +1220,8 @@ present_client_artifacts() {
 }
 
 browse_client_config_ui() {
-  local name args i sel f tmp
+  local name i sel f tmp tty
+  tty="$(ui_tty)"
   name="$(pick_client_name_interactive "Просмотр конфига" "Выберите клиента")" || return
   [[ -n "$name" ]] || return
   if [[ ! -d "$CLIENTS_DIR/$name" ]]; then
@@ -846,11 +1238,15 @@ browse_client_config_ui() {
   if [[ "${#_client_confs[@]}" -eq 1 ]]; then
     f="${_client_confs[0]}"
   else
-    args=()
-    for i in "${!_client_confs[@]}"; do
-      args+=("$i" "$(basename "${_client_confs[$i]}")")
-    done
-    sel="$(whiptail --title "Конфиг" --menu "Выберите файл" 22 70 12 "${args[@]}" 3>&1 1>&2 2>&3)" || return
+    {
+      printf '%b\n' "${C_HEAD}Выберите файл конфига${C_RESET}"
+      for i in "${!_client_confs[@]}"; do
+        printf '%3s) %s\n' "$i" "$(basename "${_client_confs[$i]}")"
+      done
+      printf '%b' "${C_DIM}Номер: ${C_RESET}"
+    } >"$tty"
+    read -r sel <"$tty" || return
+    [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -ge 0 && "$sel" -lt "${#_client_confs[@]}" ]] || return
     f="${_client_confs[$sel]}"
   fi
 
@@ -865,7 +1261,8 @@ browse_client_config_ui() {
 }
 
 list_clients_menu() {
-  local tmp nlines  tmp="$(mktemp)"
+  local tmp nlines
+  tmp="$(mktemp)"
   nlines="$(awk -F'|' 'NR>1' "$CLIENTS_DB" 2>/dev/null | wc -l)"
   nlines="${nlines//[[:space:]]/}"
   {
@@ -880,29 +1277,49 @@ list_clients_menu() {
     echo "Каталоги (по одному на клиента):"
     ls -1 "$CLIENTS_DIR" 2>/dev/null || echo "(пусто)"
   } >"$tmp"
-  whiptail --title "Список клиентов" --scrolltext --textbox "$tmp" 30 100
+  if command -v less >/dev/null 2>&1; then
+    LESS="${LESS:-} -R" less -FX "$tmp"
+  else
+    cat "$tmp"
+    ui_pause
+  fi
   rm -f "$tmp"
 }
 
 pick_client_name_interactive() {
-  local title="$1" subtitle="$2" dirs args d nconf sel manual
-  manual="__manual_name__"
+  local title="$1" subtitle="$2" dirs d nconf sel i tty
+  tty="$(ui_tty)"
   mapfile -t dirs < <(ls -1 "$CLIENTS_DIR" 2>/dev/null | sort)
   if [[ "${#dirs[@]}" -eq 0 ]]; then
-    whiptail --title "$title" --msgbox "Пока нет клиентов.\n$CLIENTS_DIR пуст.\n\nСоздайте клиента: п.1 в этом меню." 12 62
+    ui_print "${C_WARN}Пока нет клиентов.${C_RESET}
+${CLIENTS_DIR} пуст.
+
+Создайте клиента: п.1 в этом меню."
+    ui_pause
     return 1
   fi
-  args=()
-  for d in "${dirs[@]}"; do
-    nconf="$(find "$CLIENTS_DIR/$d" -name '*.conf' -type f 2>/dev/null | wc -l)"
-    nconf="${nconf//[[:space:]]/}"
-    args+=("$d" "$d  (${nconf} .conf)")
-  done
-  args+=("$manual" "Ввести имя каталога вручную…")
-  sel="$(whiptail --title "$title" --menu "$subtitle" 26 80 14 "${args[@]}" 3>&1 1>&2 2>&3)" || return 1
-  if [[ "$sel" == "$manual" ]]; then
+  {
+    printf '%b\n' "${C_HEAD}$title${C_RESET}"
+    printf '%s\n' "$subtitle"
+    printf '%s\n' ""
+    i=0
+    for d in "${dirs[@]}"; do
+      nconf="$(find "$CLIENTS_DIR/$d" -name '*.conf' -type f 2>/dev/null | wc -l)"
+      nconf="${nconf//[[:space:]]/}"
+      printf '%3s) %s  (%s .conf)\n' "$i" "$d" "$nconf"
+      i=$((i + 1))
+    done
+    printf '%3s) %s\n' "m" "Ввести имя каталога вручную…"
+    printf '%b' "${C_DIM}Номер, имя каталога или m: ${C_RESET}"
+  } >"$tty"
+  read -r sel <"$tty" || return 1
+  if [[ "${sel,,}" == "m" ]]; then
     input "Клиент" "Имя каталога (латиницей)" ""
-    return
+    return 0
+  fi
+  if [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -ge 0 && "$sel" -lt "${#dirs[@]}" ]]; then
+    printf '%s' "${dirs[$sel]}"
+    return 0
   fi
   printf '%s' "$sel"
 }
@@ -912,7 +1329,10 @@ delete_client_ui() {
   local name tmp
   name="$(pick_client_name_interactive "Удалить клиента" "Все устройства этого клиента исчезнут из базы и с диска.")" || return
   [[ -n "$name" ]] || return
-  if ! whiptail --title "Удаление" --yesno "Удалить клиента «$name»?\n\nИз clients.db, каталога и пиров (пересборка из оставшихся записей).\nНа другой entry-VPS: скопируйте state/ или повторите удаление/синхронизацию там." 16 72; then
+  if ! confirm_yes "Удалить клиента «$name»?
+
+Из clients.db, каталога и пиров (пересборка из оставшихся записей).
+На другой entry-VPS: скопируйте state/ или повторите удаление/синхронизацию там."; then
     return
   fi
   tmp="$(mktemp)"
@@ -933,7 +1353,7 @@ export_client_archive_ui() {
 }
 
 menu_clients_repair_from_db() {
-  if ! whiptail --title "Синхронизация пиров" --yesno "Пересобрать $SERVER_PEERS_DIR/*.conf из clients.db и перезаписать wg-users на этом сервере (для entry-нод с совпадающим ключом)?" 12 74; then
+  if ! confirm_yes "Пересобрать $SERVER_PEERS_DIR/*.conf из clients.db и перезаписать wg-users на этом сервере (для entry-нод с совпадающим ключом)?"; then
     return
   fi
   repair_peers_and_wg_users_from_db
@@ -945,15 +1365,8 @@ open_lists_hint() {
 }
 
 regenerate_bootstrap() {
-  sanitize_nodes_db
-  awk -F'|' 'NR>1 {print $1 "|" $2}' "$NODES_DB" | while IFS='|' read -r id r; do
-    if [[ "$r" == "entry-exit" ]]; then
-      render_bootstrap_entry_exit "$id" "$BOOTSTRAP_DIR/bootstrap-$id.sh"
-    else
-      render_bootstrap_exit_only "$id" "$BOOTSTRAP_DIR/bootstrap-$id.sh"
-    fi
-  done
-  msg "Bootstrap-скрипты пересозданы: $BOOTSTRAP_DIR"
+  regenerate_all_bootstraps_and_bundles
+  msg "Пересозданы: $BOOTSTRAP_DIR и $JOIN_BUNDLE_DIR"
 }
 
 wg_iface_list() {
@@ -1068,7 +1481,12 @@ show_nodes_status() {
     printf '\n  Источник: %s\n\n' "$NODES_DB"
   } >"$rep"
 
-  whiptail --title "Статус нод" --scrolltext --textbox "$rep" 34 108
+  if command -v less >/dev/null 2>&1; then
+    LESS="${LESS:-} -R" less -FX "$rep"
+  else
+    cat "$rep"
+    ui_pause
+  fi
   rm -f "$rep" "$hs"
 }
 
@@ -1108,6 +1526,7 @@ init_hub() {
   fi
   render_bootstrap_entry_exit "msk-1" "$bs"
   chmod +x "$bs" 2>/dev/null || true
+  write_join_bundle_for_node "msk-1"
   if [[ "$had_msk1" -eq 0 ]]; then
     if ! bash "$bs"; then
       msg "База: $WG_HUB_HOME\nНе удалось поднять exit (WireGuard + NAT) автоматически. Запустите:\n  bash $bs"
@@ -1132,15 +1551,10 @@ main() {
     c="$(menu_main)"
     case "$c" in
       1) init_hub ;;
-      2) create_or_update_node "entry-exit" ;;
-      3) create_or_update_node "exit-only" ;;
-      4) menu_clients ;;
-      5) open_lists_hint ;;
-      6) regenerate_bootstrap ;;
-      7) healthcheck ;;
-      8) backup_state ;;
-      r) resync_wg_users_local ;;
-      t) show_nodes_status ;;
+      2) menu_nodes ;;
+      3) menu_clients ;;
+      4) open_lists_hint ;;
+      5) menu_service ;;
       0) exit 0 ;;
       *) ;;
     esac
