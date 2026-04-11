@@ -43,7 +43,26 @@ if [[ "${WG_JOIN_ROLE}" == "entry-exit" ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+
+# Облачные VPS: незавершённый grub-pc ломает любой apt (нет диска для grub-install).
+pre_apt_unstick_dpkg() {
+  local fix=0
+  dpkg --audit 2>/dev/null | grep -q . && fix=1
+  if dpkg -l grub-pc 2>/dev/null | grep -qE '^.. +(iF|iU)'; then
+    fix=1
+  fi
+  [[ "$fix" -eq 1 ]] || return 0
+  log "Зависший dpkg (часто grub-pc на VPS) — пробуем безопасное завершение настройки…"
+  if command -v debconf-set-selections >/dev/null 2>&1; then
+    printf '%s\n' 'grub-pc grub-pc/install_devices_empty boolean true' | debconf-set-selections || true
+  fi
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+  apt-get install -y -f || true
+}
+
+pre_apt_unstick_dpkg
 apt-get update -y
+pre_apt_unstick_dpkg
 apt-get install -y wireguard-tools nftables iproute2
 
 install -d -m 700 /etc/wireguard

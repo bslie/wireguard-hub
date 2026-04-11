@@ -850,12 +850,29 @@ export LC_ALL=C.UTF-8 LANG=C.UTF-8
 log(){ printf '[bootstrap] %s\n' "$*"; }
 die(){ printf '[bootstrap][error] %s\n' "$*" >&2; exit 1; }
 
+pre_apt_unstick_dpkg() {
+  local fix=0
+  dpkg --audit 2>/dev/null | grep -q . && fix=1
+  if dpkg -l grub-pc 2>/dev/null | grep -qE '^.. +(iF|iU)'; then
+    fix=1
+  fi
+  [[ "$fix" -eq 1 ]] || return 0
+  log "Зависший dpkg (часто grub-pc на VPS) — пробуем безопасное завершение настройки…"
+  if command -v debconf-set-selections >/dev/null 2>&1; then
+    printf '%s\n' 'grub-pc grub-pc/install_devices_empty boolean true' | debconf-set-selections || true
+  fi
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+  apt-get install -y -f || true
+}
+
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Требуется root."
 OS_VER="$(. /etc/os-release && echo "${VERSION_ID:-}")"
 [[ "$OS_VER" == "13" ]] || die "Поддерживается только Debian 13."
 
 export DEBIAN_FRONTEND=noninteractive
+pre_apt_unstick_dpkg
 apt-get update -y
+pre_apt_unstick_dpkg
 apt-get install -y wireguard-tools nftables iproute2
 
 install -d -m 700 /etc/wireguard
